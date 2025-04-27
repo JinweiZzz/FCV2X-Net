@@ -108,7 +108,7 @@ class Env:
         self.veh2dest = {veh.id: veh.schedules[0].trips[0].routes[0].driving.road_ids[-1] for veh in vehs.persons}
 
         self.source_state_dim = 3
-        self.neighbor_state_dim = 4
+        self.neighbor_state_dim = 6
         self.edge_dim = 2
 
         if os.path.exists(f'{data_path}/selected_person_ids.json'):
@@ -301,12 +301,60 @@ class Env:
                         missing_phase[i, j] = 1
             return phase_lanes_inflow, phase_lanes_outflow, zero_lanes_inflow, zero_lanes_outflow, missing_lanes_inflow, missing_lanes_outflow, non_zeros_inflow, non_zeros_outflow, missing_phase
 
+        ### 获取路口转向可走的相位选择
+        def phase_road_encoder():
+            road2phase = {}
+            road2junction = {}
+
+            if os.path.exists(f'{data_path}/selected_junction_ids.json'):
+                valid_jids = json.load(open(f'{data_path}/selected_junction_ids.json'))
+            else:
+                valid_jids = [junction.id for junction in M.junctions]   
+            jids = [junction.id for junction in M.junctions]   
+
+            for jid in jids:
+                if jid not in valid_jids:
+                    continue
+                junction = M.junctions[self.junction_id2idxs[jid]]
+
+                for phase_idx, phase in enumerate(junction.fixed_program.phases):
+                    ### 右转选择
+                    right_green_signal = np.array([1 if j == 2 and laneid2features[i].turn == 3 else 0 for i, j in zip(junction.lane_ids, phase.states)])
+                    right_in_lane = np.array([laneid2features[lane_id].predecessors[0].id for lane_id in junction.lane_ids])[right_green_signal==1].tolist()
+                    right_out_lane = np.array([laneid2features[lane_id].successors[0].id for lane_id in junction.lane_ids])[right_green_signal==1].tolist()
+
+                    right_in_lane_parents = [laneid2features[lane_id].parent_id for lane_id in right_in_lane]
+                    right_out_lane_parents = [laneid2features[lane_id].parent_id for lane_id in right_out_lane]
+
+                    for (in_lane_parent, out_lane_parent) in zip(right_in_lane_parents, right_out_lane_parents):
+                        if (in_lane_parent, out_lane_parent) not in road2phase:
+                            road2phase[(in_lane_parent, out_lane_parent)] = [0, 0, 0, 0]   ### 不构成相位观察里的内容
+                            road2junction[(in_lane_parent, out_lane_parent)] = valid_jids.index(jid)
+
+                    ### 非右转选择
+                    green_signal = np.array([1 if j == 2 and laneid2features[i].turn != 3 else 0 for i, j in zip(junction.lane_ids, phase.states)])    
+                    in_lane = np.array([laneid2features[lane_id].predecessors[0].id for lane_id in junction.lane_ids])[green_signal==1].tolist()
+                    out_lane = np.array([laneid2features[lane_id].successors[0].id for lane_id in junction.lane_ids])[green_signal==1].tolist()
+
+                    in_lane_parents = set(np.array([laneid2features[lane_id].parent_id for lane_id in in_lane]).tolist())
+                    out_lane_parents = set(np.array([laneid2features[lane_id].parent_id for lane_id in out_lane]).tolist())
+
+                    for (in_lane_parent, out_lane_parent) in zip(in_lane_parents, out_lane_parents):
+                        if (in_lane_parent, out_lane_parent) not in road2phase:
+                            road2phase[(in_lane_parent, out_lane_parent)] = [0, 0, 0, 0]   
+                            road2phase[(in_lane_parent, out_lane_parent)][phase_idx] = 1
+                            road2junction[(in_lane_parent, out_lane_parent)] = valid_jids.index(jid)
+            return road2phase, road2junction
+        
+        self.road2phase, self.road2junction = phase_road_encoder()
+
         if os.path.exists(f'{data_path}/selected_junction_ids.json'):
             jids = json.load(open(f'{data_path}/selected_junction_ids.json'))
         else:
             jids = list([junction.id for junction in M.junctions])
 
         self.num_junctions = len(jids)
+        self.intention = args.intention
         jidxs = [self.junction_id2idxs[jid] for jid in jids]
         self.jids = jids
         self.jidxs = jidxs
@@ -394,11 +442,18 @@ class Env:
 
         G = nx.DiGraph()
         G.add_weighted_edges_from(edge_set)
+
+        def calculate_direct_distance(x1, y1, x2, y2):
+            dx = np.array(x2 - x1)
+            dy = np.array(y2 - y1)
+            direct_distance = np.sqrt(dx**2 + dy**2)
+            return direct_distance
         
         ### 提前存储所有路和所有终点之间的关系
         self.angle_matrix = np.zeros((len(M.roads), len(M.roads)))
         self.direction_matrix = np.zeros(len(M.roads))
         self.distance_matrix = np.ones((len(M.roads), len(M.roads)))*(-1000)
+        self.direct_distance_matrix = np.zeros((len(M.roads), len(M.roads)))
         shortest_distance = {}
         for i, road in enumerate(M.roads):
             ### 
@@ -413,8 +468,9 @@ class Env:
                 shortest_path = [self.junctionidx2id[junction] for junction in shortest_path]
                 shortest_distance[(road.id, end_road.id)] = shortest_path
                 self.distance_matrix[i, j] += road_length[i]
+                self.direct_distance_matrix[i, j] = calculate_direct_distance(self.road_start_xs[i], self.road_start_ys[i], self.road_start_xs[j], self.road_start_ys[j])
                 
-        self.angle_triplet_matrix = np.zeros((len(M.roads), len(M.roads), len(M.roads)))    ### 存储路B在从路A到路C中间的关系
+        self.angle_triplet_matrix = np.zeros((len(M.roads), len(M.roads), len(M.roads)))    ### 存储路B在从路A到路C中间的关系 是否是顺承关系
         for i, road in enumerate(M.roads):
             for j, end_road in enumerate(M.roads):
                 if i == j:
@@ -424,6 +480,15 @@ class Env:
                     mid_x, mid_y = self.road_start_xs[k], self.road_start_ys[k]
                     end_x, end_y = self.road_start_xs[j], self.road_start_ys[j]
                     self.angle_triplet_matrix[i, k, j] = calculate_angle(start_x, start_y, mid_x, mid_y, end_x, end_y)
+
+        self.angle_distance_matrix = np.zeros((len(M.roads), len(M.roads), len(M.roads)))    ### 存储路B在从路A到路C中间的关系 去B是否绕开了角度
+        for i, road in enumerate(M.roads):
+            for j, end_road in enumerate(M.roads):
+                for k, mid_road in enumerate(M.roads):
+                    start_x, start_y = self.road_start_xs[i], self.road_start_ys[i]
+                    mid_x, mid_y = self.road_start_xs[k], self.road_start_ys[k]
+                    end_x, end_y = self.road_start_xs[j], self.road_start_ys[j]
+                    self.angle_distance_matrix[i, k, j] = abs(calculate_direction(start_x, start_y, mid_x, mid_y) - calculate_direction(start_x, start_y, end_x, end_y))
 
         ## 存储道路在不同时间步的属性
         self.road_states = np.zeros((self.step_count+1, len(M.roads), self.neighbor_state_dim))
@@ -438,8 +503,8 @@ class Env:
                     self.road_adj_mask[self.road_id2idxs[road], self.road_id2idxs[two_hop_adjroad]] = 1
 
         ### 对junction进行构图
-        self.junction_edges, self.junction_edge_feats = [], []
-        self.junction_edge_list = [[] for _ in range(len(self.jids))]
+        self.junction_edges, self.junction_edge_feats = [], []      ### self.junction_edges对应的是(out_node, in_node)
+        self.junction_edge_list = [[] for _ in range(len(self.jids))]       ### 这里记录的是(in_node, out_node)
         for jidx, out_lanes in enumerate(self.out_lanes):
             for out_lane in out_lanes:
                 ids = [jid for (jid, in_lanes) in enumerate(self.in_lanes) if out_lane in in_lanes]
@@ -501,8 +566,8 @@ class Env:
         for i, idxs in enumerate(self.junction_edge_list):
             if len(idxs) == 0:
                 continue
-            self.junction_edge_distance[i, :len(idxs), :] = np.array([min(self.junction_edge_feats[self.junction_edges.index([i, j])][0], 500) for j in idxs]).reshape(-1, 1)    # 超过500米的邻居也认为是500米算
-            self.junction_edge_strength[i, :len(idxs), :] = np.array([self.junction_edge_feats[self.junction_edges.index([i, j])][1] for j in idxs]).reshape(-1, 1)
+            self.junction_edge_distance[i, :len(idxs), :] = np.array([min(self.junction_edge_feats[self.junction_edges.index([j, i])][0], 500) for j in idxs]).reshape(-1, 1)    # 超过500米的邻居也认为是500米算
+            self.junction_edge_strength[i, :len(idxs), :] = np.array([self.junction_edge_feats[self.junction_edges.index([j, i])][1] for j in idxs]).reshape(-1, 1)
         self.junction_edge_distance = self.junction_edge_distance/100
         self.junction_edge_distance = np.concatenate([self.junction_edge_distance, self.junction_edge_strength], axis=2)
 
@@ -532,7 +597,17 @@ class Env:
             self.junction_neighbor_type_rearraged[dst_idx, :] = self.junction_neighbor_type[dst_idx, idxs_new]
             self.junction_edge_distance_rearraged[dst_idx, :] = self.junction_edge_distance[dst_idx, idxs_new]
 
+        self.action_mean_field_query_matrix = np.zeros((self.num_roads, self.num_roads, self.num_roads))
+        for i, road in enumerate(M.roads):
+            for j, dest in enumerate(M.roads):
+                for k, mid_road in enumerate(M.roads):
+                    direct_distance = self.direct_distance_matrix[i, k]
+                    angle = self.angle_distance_matrix[i, k, j]
+                    mid_road_angle = calculate_direction(self.road_start_xs[k], self.road_start_ys[k], self.road_end_xs[k], self.road_end_ys[k]) - calculate_direction(self.road_start_xs[k], self.road_start_ys[k], self.road_start_xs[j], self.road_start_ys[j])
+                    self.action_mean_field_query_matrix[i, k, j] = np.exp(-(direct_distance/500)) * (1+np.cos(angle)) * (1+np.cos(mid_road_angle))      ### 距离衰减参数是个超参
+        
         ### 初始states
+        self.vehicle_actions = {}
         self.fresh_state()
         self.roadidx2corrroadidx = self.roadidx2adjroadidx
 
@@ -540,8 +615,12 @@ class Env:
         self.balancing_coef = args.balancing_coef
 
         self.routing_queries = []
-
+        self.agg = args.agg
+        self.corr_agg = args.corr_agg
         self.lc_interval = args.lc_interval
+
+        if self.corr_agg == 1:
+            self.lc_edge_extract()
 
     def lc_edge_extract(self):
         road_count = torch.tensor(self.road_states[:self._step, :, 0]).T        ### num_roads*step_count
@@ -566,6 +645,12 @@ class Env:
         for i, road in enumerate(self.road_idxs2id):
             self.road2corrroad[road] = [self.road_idxs2id[j] for j in topk_idx[i]]
             self.roadidx2corrroadidx[i] = topk_idx[i].tolist()
+
+        ### 转换成corr adj matrix
+        self.road_corr_adj_matrix = np.zeros((len(self.road_idxs2id), len(self.road_idxs2id)))
+        for road in self.roadidx2corrroadidx:
+            for corrroad in self.roadidx2corrroadidx[road]:
+                self.road_corr_adj_matrix[road, corrroad] = 1
 
     def add_env_vc(self, vid, road, time, destination):
         self.vehicles[vid]={
@@ -628,8 +713,10 @@ class Env:
         action = self.road2adjroad[road][action]
         if action != dest:
             self.eng.set_vehicle_route(veh, [road, action, dest])
+            self.vehicle_actions[veh] = (road, action)
         else:
             self.eng.set_vehicle_route(veh, [road, dest])
+            self.vehicle_actions[veh] = (road, dest)
         self.vehicles[veh]['next_road'] = action
         self.vehicles[veh]['last_road'] = road
     
@@ -661,6 +748,8 @@ class Env:
         self.total_travel_time += self._step-self.vehicles[vc]['start_time']
         self.success_travel += 1 if not timeout else 0
         self.total_travel += 1
+        if vc in self.vehicle_actions:
+            del self.vehicle_actions[vc]
 
     def lane_vehicle_cal(self):
         speed_threshold = 0.1
@@ -673,24 +762,34 @@ class Env:
                     vehicle_waiting_counts[self.lane_id2idxs[lane]] += 1
         return vehicle_counts, vehicle_waiting_counts
     
-    def road_speed_cal(self, road_vehicle_count):
-        road_speed_overall = np.zeros(len(self.road_id2idxs))
-        for status, v, road in zip(self.eng.fetch_persons()['status'], self.eng.fetch_persons()['v'], self.eng.fetch_persons()['lane_parent_id']):
-            if status == 2 and road < 300000000:
-                road_speed_overall[self.road_id2idxs[road]] += v
-        road_speed_ave = road_speed_overall/road_vehicle_count
-        road_travel_time_ave = self.road_length/road_speed_ave
+    # def road_speed_cal(self, road_vehicle_count): ### 可以直接通过fetch_lanes获取speed
+    #     road_speed_overall = np.zeros(len(self.road_id2idxs))
+    #     for status, v, road in zip(self.eng.fetch_persons()['status'], self.eng.fetch_persons()['v'], self.eng.fetch_persons()['lane_parent_id']):
+    #         if status == 2 and road < 300000000:
+    #             road_speed_overall[self.road_id2idxs[road]] += v
+    #     road_speed_ave = road_speed_overall/road_vehicle_count
+    #     road_travel_time_ave = self.road_length/road_speed_ave
 
-        # 将nan值设为-1
-        road_speed_ave[np.isnan(road_speed_ave)] = -1
-        road_travel_time_ave[np.isnan(road_travel_time_ave)] = -1
+    #     # 将nan值设为-1
+    #     road_speed_ave[np.isnan(road_speed_ave)] = -1
+    #     road_travel_time_ave[np.isnan(road_travel_time_ave)] = -1
 
-        ### 将travel_time_ave为np.inf的值设为-1
-        road_travel_time_ave[np.isinf(road_travel_time_ave)] = -1
-        return road_speed_ave, road_travel_time_ave
+    #     ### 将travel_time_ave为np.inf的值设为-1
+    #     road_travel_time_ave[np.isinf(road_travel_time_ave)] = -1
+    #     return road_speed_ave, road_travel_time_ave
     
-    def fresh_state(self):
+    def action_mean_field_cal(self, action, dest):
+        road = self.eng.fetch_persons()['lane_parent_id'][self.veh_id2idxs[dest]]
+        action_mean_field = np.zeros((self.num_roads, 1))
+        if action != dest:
+            action_mean_field[self.road_id2idxs[road], action] += 1
+        else:
+            action_mean_field[self.road_id2idxs[road], dest] += 1
+        return action_mean_field
+
+    def fresh_state(self):  ### 可以考虑通过fetch_lanes加入speed
         lane_vehicle_counts, lane_vehicle_waiting_counts = self.lane_vehicle_cal()
+        lane_speeds = self.eng.fetch_lanes()['v_avg']
         road_vehicle = lane_vehicle_counts[self.lanes_list]
         road_vehicle[self.lanes_zero==1]==0
         road_vehicle = np.sum(road_vehicle, axis=1)
@@ -704,7 +803,17 @@ class Env:
         road_length = self.road_length
         road_direction = self.direction_matrix/180
 
-        self.road_state = np.vstack([road_vehicle_density, road_waiting_vehicle_density, road_length, road_direction]).T
+        road_speeds = lane_speeds[self.lanes_list]
+        road_speeds[self.lanes_zero==1] = 0
+        road_speeds = np.mean(road_speeds, axis=1)/40
+
+        ### 获取动作平均场
+        self.action_mean_field = np.zeros((1, self.num_roads))
+        for vc, (road, action) in self.vehicle_actions.items():
+            dest = self.veh2dest[vc]
+            self.action_mean_field += self.action_mean_field_query_matrix[self.road_id2idxs[action], :, self.road_id2idxs[dest]].reshape(1, -1)
+
+        self.road_state = np.vstack([road_vehicle_density, road_waiting_vehicle_density, road_length, road_direction, road_speeds, self.action_mean_field]).T
         self.road_states[self._step] = self.road_state
 
     ### 获取临近道路的静态特征
@@ -712,7 +821,8 @@ class Env:
         state = np.zeros((self.max_action_size*self.source_state_dim+1))
             
         adj_roadidxs = self.roadidx2adjroadidx[self.road_id2idxs[road]]
-        road_angle = self.angle_matrix[adj_roadidxs, self.road_id2idxs[destination]]        ### angle_matrix要重新定义
+        # road_angle = self.angle_matrix[adj_roadidxs, self.road_id2idxs[destination]]        ### angle_matrix要重新定义
+        road_angle = self.direction_matrix[adj_roadidxs]/180
         road_distance = self.distance_matrix[adj_roadidxs, self.road_id2idxs[destination]]
         road_length = self.road_length[adj_roadidxs]
         state[:len(road_angle)] = road_distance/1000  
@@ -730,7 +840,17 @@ class Env:
         in_cnt_states[self.junction_missing_lanes_inflow==1] = -1
         in_cnt_states = np.sum(in_cnt_states, axis=2)
         in_cnt_states[self.junction_missing_phase==1] = -1
-        observe_states = np.concatenate([in_cnt_states, self.junction_phase_sizes], axis=1)
+        
+        if self.intention == 1:
+            ### 加入车辆转向意图观察
+            self.junction_actions = np.zeros((len(self.junction_phase_sizes), self.max_junction_action_size))
+            for veh, (road, action) in self.vehicle_actions.items():
+                if (road, action) not in self.road2junction:
+                    continue
+                self.junction_actions[self.road2junction[(road, action)]] += self.road2phase[(road, action)]
+            observe_states = np.concatenate([in_cnt_states, self.junction_actions, self.junction_phase_sizes], axis=1)
+        else:
+            observe_states = np.concatenate([in_cnt_states, self.junction_phase_sizes], axis=1)
         return observe_states
 
     def extra_reward(self, vc, last_road, next_road):
@@ -753,10 +873,7 @@ class Env:
             self.one_hot_action_matrix = self.one_hot_mapping_matrix[np.array(junction_actions).reshape(-1), :]
             junction_experiences = {'junction_states': None, 'junction_rewards': None, 'junction_dones': None, 'junction_actions': junction_actions}
 
-        try:
-            self.eng.next_step(1)
-        except:
-            print(actions, junction_actions, self._step)
+        self.eng.next_step(1)
         self._step = self._step + 1
         if self.record:
             self.recorder.record()
@@ -1025,8 +1142,7 @@ class ReplayBuffer:
         self.add(agg_experience)
 
         if timeout:
-            self.replay_tmp = defaultdict(lambda: Replay_tmp(self.max_size))        ### 清空临时buffer
-
+            self.replay_tmp = defaultdict(lambda: Replay_tmp(self.max_size))      
         return len(agg_experience)
     
 class J_Replay_tmp:
@@ -1136,7 +1252,7 @@ def main():
     parser.add_argument('--data', type=str, default='data/hangzhou')
     parser.add_argument('--step_count', type=int, default=3600)
     parser.add_argument('--interval', type=int, default=1)
-    parser.add_argument('--reward', type=str, default='time')   # 是否加入附加reward
+    parser.add_argument('--reward', type=str, default='time')   
     parser.add_argument('--reward_weight', type=float, default=1)
     parser.add_argument('--tl_interval', type=int, default=15, help='interval of tl policies')
     parser.add_argument('--algo', choices=['ft_builtin', 'mp_builtin'], default='mp_builtin')
@@ -1161,7 +1277,7 @@ def main():
     parser.add_argument("--balancing_coef", type=float, default=0.5, help='balancing coefficient for two rewards')
     parser.add_argument("--first", type=int, default=0)
     parser.add_argument("--dqn_type", type=str, choices=['dqn', 'dueling'], default='dqn')
-    parser.add_argument('--agg_type', type=str, choices=['none', 'bgcn'], default='none')
+    parser.add_argument('--agg_type', type=str, choices=['none', 'bgcn', 'agg', 'corr_agg'], default='none')
     parser.add_argument('--lc_interval', type=int, default=300, help='interval of lc policies')
     parser.add_argument('--basic_update_times', type=int, default=1)
     parser.add_argument('--exploration_times', type=int, default=4000000)
@@ -1170,14 +1286,15 @@ def main():
     parser.add_argument("--attn", type=str, choices=['type_sigmoid_attn', 'none'], default='type_sigmoid_attn')
     parser.add_argument('--distance', type=int, default=2, help='whether to use distance as edge feature')
     parser.add_argument('--junction_agg', type=int, default=1, help='whether to use neighbor junction information')
-    
+    parser.add_argument('--mean_field', type=int, default=1, help='whether to use the mean field information')
+    parser.add_argument('--intention', type=int, default=1, help='whether to use the vehicle intention information in junction observation')
     args = parser.parse_args()
 
     args.city = args.data.split('/')[-1]
     
     setproctitle.setproctitle('Router@zengjinwei')
 
-    path = 'log/router/{}_{}_gamma={}_lr={}_batch_size={}_reward={}_rw={}_ts={}_et={}_ut={}_et={}_agg_type={}_jts={}_jet={}_{}'.format(args.data, args.dqn_type, args.gamma, args.lr, args.batchsize, args.reward, args.reward_weight, args.training_start, args.experience_threshold, args.update_threshold, args.exploration_times, args.agg_type, args.junction_training_start, args.junction_experience_threshold, time.strftime('%d%H%M'))
+    path = 'log/router/{}_{}_gamma={}_lr={}_batch_size={}_reward={}_rw={}_ts={}_et={}_ut={}_et={}_agg_type={}_jts={}_jet={}_mf={}_int={}_{}'.format(args.data, args.dqn_type, args.gamma, args.lr, args.batchsize, args.reward, args.reward_weight, args.training_start, args.experience_threshold, args.update_threshold, args.exploration_times, args.agg_type, args.junction_training_start, args.junction_experience_threshold, args.mean_field, args.intention, time.strftime('%d%H%M'))
     os.makedirs(path, exist_ok=True)
     with open(f'{path}/cmd.sh', 'w') as f:
         f.write(' '.join(sys.argv))
@@ -1200,8 +1317,17 @@ def main():
     else:
         raise NotImplementedError
     
-    if args.agg_type == 'bgcn':
+    if args.agg_type == 'bgcn' or args.agg_type == 'none':
         args.agg = 1
+        args.corr_agg = 1
+    elif args.agg_type == 'agg':
+        args.agg = 1
+        args.corr_agg = 0
+    elif args.agg_type == 'corr_agg':
+        args.agg = 1
+        args.corr_agg = 1
+    else:
+        raise NotImplementedError
     
     env = Env(
         data_path=args.data,
@@ -1282,31 +1408,46 @@ def main():
     ### 存入replay
     j_replay.add_tmp({'junction_states': junction_states, 'junction_actions': None, 'junction_available_actions': junction_available_actions, 'junction_rewards': None, 'junction_dones': None})
     junction_obs_dim = junction_states.shape[1]
-    Q = BGCN_Actor(args, 
-                   source_obs_dim=env.source_state_dim*env.max_action_size+1, 
-                   obs_dim=env.neighbor_state_dim, 
-                   edge_dim=env.edge_dim,
-                   max_action=env.max_action_size, 
-                   roadidx2neighboridxs=env.roadidx2adjroadidx, 
-                   device=device).to(device)
     if args.dqn_type == 'dqn':
-        # Q = R_Actor(args,
-        #             source_state_dim=env.source_state_dim,
-        #             neighbor_state_dim=env.neighbor_state_dim,
-        #             edge_dim=env.edge_dim,
-        #             max_actions=env.max_action_size, 
-        #             device=device).to(device)       ### 多个agent共享一个策略网络
+        if args.agg_type == 'bgcn':
+            Q = BGCN_Actor(args, 
+                source_obs_dim=env.source_state_dim*env.max_action_size+1, 
+                obs_dim=env.neighbor_state_dim, 
+                edge_dim=env.edge_dim,
+                max_action=env.max_action_size, 
+                roadidx2neighboridxs=env.roadidx2adjroadidx, 
+                device=device).to(device)
+        elif args.agg_type == 'none':
+            Q = R_Actor(args,
+                        source_state_dim=env.source_state_dim,
+                        neighbor_state_dim=env.neighbor_state_dim,
+                        edge_dim=env.edge_dim,
+                        max_actions=env.max_action_size, 
+                        device=device).to(device)       ### 多个agent共享一个策略网络
+        else:
+            raise NotImplementedError
         P = J_Actor(args, 
                     obs_dim=junction_obs_dim,
                     action_dim=env.max_junction_action_size, 
                     device=device).to(device) 
     elif args.dqn_type == 'dueling':
-        # Q = VR_Actor(args,
-        #             source_state_dim=env.source_state_dim,
-        #             neighbor_state_dim=env.neighbor_state_dim,
-        #             edge_dim=env.edge_dim,
-        #             max_actions=env.max_action_size, 
-        #             device=device).to(device)
+        if args.agg_type == 'bgcn':
+            Q = BGCN_Actor(args, 
+                source_obs_dim=env.source_state_dim*env.max_action_size+1, 
+                obs_dim=env.neighbor_state_dim, 
+                edge_dim=env.edge_dim,
+                max_action=env.max_action_size, 
+                roadidx2neighboridxs=env.roadidx2adjroadidx, 
+                device=device).to(device)
+        elif args.agg_type == 'none':
+            Q = VR_Actor(args,
+                        source_state_dim=env.source_state_dim,
+                        neighbor_state_dim=env.neighbor_state_dim,
+                        edge_dim=env.edge_dim,
+                        max_actions=env.max_action_size, 
+                        device=device).to(device)
+        else:
+            raise NotImplementedError
         P = VJ_Actor(args,
                     obs_dim=junction_obs_dim,
                     action_dim=env.max_junction_action_size, 
