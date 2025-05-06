@@ -144,7 +144,6 @@ class Env:
         self.total_travel_time, self.total_travel = 0, 0
         self.data_path = data_path
         
-
         ## 对所有的路学习相接
         laneid2features = {}
         for lane in M.lanes:
@@ -310,11 +309,8 @@ class Env:
                 valid_jids = json.load(open(f'{data_path}/selected_junction_ids.json'))
             else:
                 valid_jids = [junction.id for junction in M.junctions]   
-            jids = [junction.id for junction in M.junctions]   
 
-            for jid in jids:
-                if jid not in valid_jids:
-                    continue
+            for jid in valid_jids:
                 junction = M.junctions[self.junction_id2idxs[jid]]
 
                 for phase_idx, phase in enumerate(junction.fixed_program.phases):
@@ -619,8 +615,9 @@ class Env:
         self.corr_agg = args.corr_agg
         self.lc_interval = args.lc_interval
 
+        self.road_corr_adj_matrix = np.zeros((len(self.road_idxs2id), len(self.road_idxs2id)))
         if self.corr_agg == 1:
-            self.lc_edge_extract()
+            self.road_corr_adj_matrix = np.zeros((len(self.road_idxs2id), len(self.road_idxs2id)))
 
     def lc_edge_extract(self):
         road_count = torch.tensor(self.road_states[:self._step, :, 0]).T        ### num_roads*step_count
@@ -648,9 +645,8 @@ class Env:
 
         ### 转换成corr adj matrix
         self.road_corr_adj_matrix = np.zeros((len(self.road_idxs2id), len(self.road_idxs2id)))
-        for road in self.roadidx2corrroadidx:
-            for corrroad in self.roadidx2corrroadidx[road]:
-                self.road_corr_adj_matrix[road, corrroad] = 1
+        for (road, corrroad) in self.roadidx2corrroadidx.items():
+            self.road_corr_adj_matrix[road, corrroad] = 1
 
     def add_env_vc(self, vid, road, time, destination):
         self.vehicles[vid]={
@@ -878,6 +874,10 @@ class Env:
         if self.record:
             self.recorder.record()
 
+        if self.corr_agg == 1:
+            if self._step % self.lc_interval == 0:
+                self.lc_edge_extract()
+
         junction_states, junction_reward = None, None
         junction_done = 0
         self.info['junction_reward'] = None
@@ -926,7 +926,7 @@ class Env:
 
         next_veh, success_veh = [], []
         all_rewards, time_rewards, distance_rewards = 0, 0, 0
-        next_states, next_acs, next_all_states, next_edge_attrs, next_ridxs = [], [], [], [], []
+        next_states, next_acs, next_all_states, next_edge_attrs, next_ridxs, next_corr_adj_matrice = [], [], [], [], [], []
         
         self.info['reward'] = 0
         self.info['time_reward'] = 0
@@ -959,15 +959,16 @@ class Env:
                         distance_rewards += distance_reward
                     self.update_env_vc_info(vc, self._step, road, next_state[-1])
                 self.routing_queries.append((vc, self.vehicles[vc]['destination']))
-                new_experience = {vc: {'next_state': next_state, 'next_all_state': next_all_state, 'ridx': self.road_id2idxs[road], 'edge_attr': edge_attr, 'available_action': available_action, 'reward': reward, 'success': 0, 'timeout': 0, 'action_signal': 0}}
+                new_experience = {vc: {'next_state': next_state, 'next_all_state': next_all_state, 'ridx': self.road_id2idxs[road], 'edge_attr': edge_attr, 'available_action': available_action, 'reward': reward, 'success': 0, 'timeout': 0, 'action_signal': 0, 'lc_edge_adj': self.road_corr_adj_matrix}}
                 new_experiences['obs_side'].update(new_experience)
                 next_states.append(next_state)
                 next_all_states.append(next_all_state)
                 next_acs.append(available_action)
                 next_edge_attrs.append(edge_attr)
                 next_ridxs.append(self.road_id2idxs[road])
+                next_corr_adj_matrice.append(self.road_corr_adj_matrix)
 
-        assert len(next_veh) == len(self.routing_queries) == len(next_states) == len(next_acs)
+        assert len(next_veh) == len(self.routing_queries) == len(next_states) == len(next_acs) == len(next_corr_adj_matrice)
 
         for (vc, vidx, road) in finish_demands:  
             next_state, edge_attr = self.get_state(road, self.vehicles[vc]["destination"])
@@ -975,7 +976,7 @@ class Env:
             success_veh.append(vc)
             if self.vehicles[vc]['first_decision']:
                 reward = None
-                new_experience = {vc: {'next_state': next_state, 'next_all_state':next_all_state, 'ridx': self.road_id2idxs[road], 'edge_attr': edge_attr, 'available_action': None, 'reward': [10], 'success': 1, 'timeout': 0, 'action_signal': 0}}
+                new_experience = {vc: {'next_state': next_state, 'next_all_state':next_all_state, 'ridx': self.road_id2idxs[road], 'edge_attr': edge_attr, 'available_action': None, 'reward': [10], 'success': 1, 'timeout': 0, 'action_signal': 0, 'lc_edge_adj': self.road_corr_adj_matrix}}
             else:
                 distance_reward = self.extra_reward(vc, self.vehicles[vc]['last_road'], self.vehicles[vc]['next_road'])
                 time_reward = -(self._step-self.vehicles[vc]['time']) / 100
@@ -985,7 +986,7 @@ class Env:
                     reward = time_reward + distance_reward*self.balancing_coef
                 else:
                     reward = time_reward
-                new_experience = {vc: {'next_state': next_state, 'next_all_state':next_all_state,  'edge_attr': edge_attr, 'ridx': self.road_id2idxs[road], 'available_action': None, 'reward': [reward, 10], 'success': 1, 'timeout': 0, 'action_signal': 0}}
+                new_experience = {vc: {'next_state': next_state, 'next_all_state':next_all_state,  'edge_attr': edge_attr, 'ridx': self.road_id2idxs[road], 'available_action': None, 'reward': [reward, 10], 'success': 1, 'timeout': 0, 'action_signal': 0, 'lc_edge_adj': self.road_corr_adj_matrix}}
                 all_rewards += reward + 10
                 time_rewards += time_reward
                 distance_rewards += distance_reward
@@ -1004,7 +1005,7 @@ class Env:
                     self.success_routing(vc, timeout=True)
                     pass
                 elif self.vehicles[vc]['first_decision'] and self.vehicles[vc]['last_reward'] is False:
-                    new_experience = {vc: {'next_state': None, 'next_all_state':None, 'edge_attr': None, 'ridx': None, 'available_action': None, 'reward': [0], 'success': 0, 'timeout': 1, 'action_signal': 0}}
+                    new_experience = {vc: {'next_state': None, 'next_all_state':None, 'edge_attr': None, 'ridx': None, 'available_action': None, 'reward': [0], 'success': 0, 'timeout': 1, 'action_signal': 0, 'lc_edge_adj': None}}
                     new_experiences['obs_side'].update(new_experience)
                     self.success_routing(vc, timeout=True)
                     pass
@@ -1019,7 +1020,7 @@ class Env:
                         else:
                             r = time_reward
                         reward = [r, -10]
-                        new_experience = {vc: {'next_state': None, 'next_all_state':None, 'edge_attr': None, 'ridx': None, 'available_action': None, 'reward': reward, 'success': 0, 'timeout': 1, 'action_signal': 0}}
+                        new_experience = {vc: {'next_state': None, 'next_all_state':None, 'edge_attr': None, 'ridx': None, 'available_action': None, 'reward': reward, 'success': 0, 'timeout': 1, 'action_signal': 0, 'lc_edge_adj': None}}
                         new_experiences['obs_side'].update(new_experience)
                         all_rewards += r - 10
                         time_rewards += time_reward
@@ -1040,7 +1041,7 @@ class Env:
         self.info['time_reward'] = time_rewards
         self.info['distance_reward'] = distance_rewards
         info = self.info
-        return new_experiences, next_veh, success_veh, info, next_states, next_all_states, next_edge_attrs, next_ridxs, next_acs, junction_states, junction_experiences
+        return new_experiences, next_veh, success_veh, info, next_states, next_all_states, next_edge_attrs, next_ridxs, next_acs, next_corr_adj_matrice, junction_states, junction_experiences
     
 def save(model, j_model, save_dir, type='present'):
     torch.save(model.state_dict(), str(save_dir) + "/{}.pt".format(type))
@@ -1062,6 +1063,7 @@ class Replay_tmp:
         self.ob_all = deque([], max_size)
         self.edge_attr = deque([], max_size)
         self.ridxs = deque([], max_size)
+        self.corr_adj_matrix = deque([], max_size)
 
     def pop(self):
         ob = self.ob.popleft()
@@ -1072,10 +1074,12 @@ class Replay_tmp:
         ob_all = self.ob_all.popleft()
         edge_attr = self.edge_attr.popleft()
         ridx = self.ridxs.popleft()
+        corr_adj_matrix = self.corr_adj_matrix.popleft()
         next_ob = self.ob[0]
         next_ob_all = self.ob_all[0]
         next_edge_attr = self.edge_attr[0]
-        return [ob, action, available_action, reward, done, ob_all, edge_attr, ridx, next_ob, next_ob_all, next_edge_attr]
+        next_corr_adj_matrix = self.corr_adj_matrix[0]
+        return [ob, action, available_action, reward, done, ob_all, edge_attr, ridx, corr_adj_matrix, next_ob, next_ob_all, next_edge_attr, next_corr_adj_matrix]
 
 class ReplayBuffer:
     def __init__(self, max_size):
@@ -1090,10 +1094,10 @@ class ReplayBuffer:
         self.replay.extend(experiences)
 
     def sample(self, batchsize, transpose=False):
-        s, a, ac, r, d, sa, ea, ridxs, next_s, next_sa, next_ea = zip(*random.sample(self.replay, min(len(self.replay), batchsize)))
+        s, a, ac, r, d, sa, ea, ridxs, cam, next_s, next_sa, next_ea, next_cam = zip(*random.sample(self.replay, min(len(self.replay), batchsize)))
         if transpose:
-            s, a, ac, r, sa, ea, ridxs, next_s, next_sa, next_ea = (list(zip(*i)) for i in [s, a, ac, r, sa, ea, ridxs, next_s, next_sa, next_ea])
-        return s, a, ac, r, d, sa, ea, ridxs, next_s, next_sa, next_ea
+            s, a, ac, r, sa, ea, ridxs, cam, next_s, next_sa, next_ea, next_cam = (list(zip(*i)) for i in [s, a, ac, r, sa, ea, ridxs, cam, next_s, next_sa, next_ea, next_cam])
+        return s, a, ac, r, d, sa, ea, ridxs, cam, next_s, next_sa, next_ea, next_cam
 
     def add_tmp(self, experiences):     ### 给每个临时experience加观察
         timeout = 0
@@ -1112,6 +1116,7 @@ class ReplayBuffer:
                 self.replay_tmp[veh].ob_all.append(experiences['obs_side'][veh]['next_all_state'])
                 self.replay_tmp[veh].edge_attr.append(experiences['obs_side'][veh]['edge_attr'])
                 self.replay_tmp[veh].ridxs.append(experiences['obs_side'][veh]['ridx'])
+                self.replay_tmp[veh].corr_adj_matrix.append(experiences['obs_side'][veh]['lc_edge_adj'])
             elif experiences['obs_side'][veh]['success'] == 1:
                 self.replay_tmp[veh].ob.append(experiences['obs_side'][veh]['next_state'])
                 self.replay_tmp[veh].done[-1] = 1
@@ -1120,12 +1125,14 @@ class ReplayBuffer:
                 self.replay_tmp[veh].ob_all.append(experiences['obs_side'][veh]['next_all_state'])
                 self.replay_tmp[veh].edge_attr.append(experiences['obs_side'][veh]['edge_attr'])
                 self.replay_tmp[veh].ridxs.append(experiences['obs_side'][veh]['ridx'])
+                self.replay_tmp[veh].corr_adj_matrix.append(experiences['obs_side'][veh]['lc_edge_adj'])
             else:
                 timeout = 1
                 self.replay_tmp[veh].ob.append(np.full_like(self.replay_tmp[veh].ob[-1], -1))
                 self.replay_tmp[veh].ob_all.append(np.full_like(self.replay_tmp[veh].ob_all[-1], -1))
                 self.replay_tmp[veh].edge_attr.append(np.full_like(self.replay_tmp[veh].edge_attr[-1], -1))
                 self.replay_tmp[veh].ridxs.append(np.full_like(self.replay_tmp[veh].ridxs[-1], -1))
+                self.replay_tmp[veh].corr_adj_matrix.append(np.full_like(self.replay_tmp[veh].corr_adj_matrix[-1], -1))
                 for reward in experiences['obs_side'][veh]['reward']:
                     self.replay_tmp[veh].reward.append(reward)
                 if len(self.replay_tmp[veh].ob) - 1 == len(self.replay_tmp[veh].reward) == len(self.replay_tmp[veh].done) == len(self.replay_tmp[veh].action) == len(self.replay_tmp[veh].available_action):
@@ -1263,6 +1270,7 @@ def main():
     parser.add_argument('--batchsize', type=int, default=1024)
     parser.add_argument('--buffer_size', type=int, default=2**20)
     parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--start_lr', type=float, default=5e-3)
     parser.add_argument('--cuda_id', type=int, default=0)
     parser.add_argument('--mlp', type=str, default='256,256')
     parser.add_argument("--load", type=int, default=0,help='pretrain (default: 0)')
@@ -1288,13 +1296,14 @@ def main():
     parser.add_argument('--junction_agg', type=int, default=1, help='whether to use neighbor junction information')
     parser.add_argument('--mean_field', type=int, default=1, help='whether to use the mean field information')
     parser.add_argument('--intention', type=int, default=1, help='whether to use the vehicle intention information in junction observation')
+    parser.add_argument('--supervised_signal', type=int, default=0, help='whether to use supervised signal to guide adaptive graph construction')
     args = parser.parse_args()
 
     args.city = args.data.split('/')[-1]
     
     setproctitle.setproctitle('Router@zengjinwei')
 
-    path = 'log/router/{}_{}_gamma={}_lr={}_batch_size={}_reward={}_rw={}_ts={}_et={}_ut={}_et={}_agg_type={}_jts={}_jet={}_mf={}_int={}_{}'.format(args.data, args.dqn_type, args.gamma, args.lr, args.batchsize, args.reward, args.reward_weight, args.training_start, args.experience_threshold, args.update_threshold, args.exploration_times, args.agg_type, args.junction_training_start, args.junction_experience_threshold, args.mean_field, args.intention, time.strftime('%d%H%M'))
+    path = 'log/router/{}_{}_gamma={}_start_lr={}_lr={}_batch_size={}_reward={}_rw={}_ts={}_et={}_ut={}_et={}_agg_type={}_jts={}_jet={}_mf={}_int={}_ss={}_{}'.format(args.data, args.dqn_type, args.gamma, args.start_lr, args.lr, args.batchsize, args.reward, args.reward_weight, args.training_start, args.experience_threshold, args.update_threshold, args.exploration_times, args.agg_type, args.junction_training_start, args.junction_experience_threshold, args.mean_field, args.intention, args.supervised_signal, time.strftime('%d%H%M'))
     os.makedirs(path, exist_ok=True)
     with open(f'{path}/cmd.sh', 'w') as f:
         f.write(' '.join(sys.argv))
@@ -1409,45 +1418,25 @@ def main():
     j_replay.add_tmp({'junction_states': junction_states, 'junction_actions': None, 'junction_available_actions': junction_available_actions, 'junction_rewards': None, 'junction_dones': None})
     junction_obs_dim = junction_states.shape[1]
     if args.dqn_type == 'dqn':
-        if args.agg_type == 'bgcn':
-            Q = BGCN_Actor(args, 
-                source_obs_dim=env.source_state_dim*env.max_action_size+1, 
-                obs_dim=env.neighbor_state_dim, 
-                edge_dim=env.edge_dim,
-                max_action=env.max_action_size, 
-                roadidx2neighboridxs=env.roadidx2adjroadidx, 
-                device=device).to(device)
-        elif args.agg_type == 'none':
-            Q = R_Actor(args,
-                        source_state_dim=env.source_state_dim,
-                        neighbor_state_dim=env.neighbor_state_dim,
-                        edge_dim=env.edge_dim,
-                        max_actions=env.max_action_size, 
-                        device=device).to(device)       ### 多个agent共享一个策略网络
-        else:
-            raise NotImplementedError
+        Q = BGCN_Actor(args, 
+            source_obs_dim=env.source_state_dim*env.max_action_size+1, 
+            obs_dim=env.neighbor_state_dim, 
+            edge_dim=env.edge_dim,
+            max_action=env.max_action_size, 
+            roadidx2neighboridxs=env.roadidx2adjroadidx, 
+            device=device).to(device)
         P = J_Actor(args, 
                     obs_dim=junction_obs_dim,
                     action_dim=env.max_junction_action_size, 
                     device=device).to(device) 
     elif args.dqn_type == 'dueling':
-        if args.agg_type == 'bgcn':
-            Q = BGCN_Actor(args, 
-                source_obs_dim=env.source_state_dim*env.max_action_size+1, 
-                obs_dim=env.neighbor_state_dim, 
-                edge_dim=env.edge_dim,
-                max_action=env.max_action_size, 
-                roadidx2neighboridxs=env.roadidx2adjroadidx, 
-                device=device).to(device)
-        elif args.agg_type == 'none':
-            Q = VR_Actor(args,
-                        source_state_dim=env.source_state_dim,
-                        neighbor_state_dim=env.neighbor_state_dim,
-                        edge_dim=env.edge_dim,
-                        max_actions=env.max_action_size, 
-                        device=device).to(device)
-        else:
-            raise NotImplementedError
+        Q = BGCN_Actor(args, 
+            source_obs_dim=env.source_state_dim*env.max_action_size+1, 
+            obs_dim=env.neighbor_state_dim, 
+            edge_dim=env.edge_dim,
+            max_action=env.max_action_size, 
+            roadidx2neighboridxs=env.roadidx2adjroadidx, 
+            device=device).to(device)
         P = VJ_Actor(args,
                     obs_dim=junction_obs_dim,
                     action_dim=env.max_junction_action_size, 
@@ -1458,7 +1447,7 @@ def main():
     warmup_steps = 10000
     total_steps = 2*10**6
     final_lr = args.lr
-    initial_lr = 5e-3
+    initial_lr = args.start_lr
     def lr_schedule_fn(step):
         if step < warmup_steps:
             return step / warmup_steps
@@ -1492,13 +1481,17 @@ def main():
                     obs_all = torch.tensor(np.array(obs_all), dtype=torch.float32, device=device)
                     edge_attrs = torch.tensor(np.array(edge_attrs), dtype=torch.float32, device=device)
                 ac = available_actions.sum(axis=1)
+                corr_adj_matrice = torch.tensor(np.array(corr_adj_matrice), dtype=torch.float32, device=device)
 
                 action_explore = [random.randint(0, a-1) for a in ac]
                 if step < args.training_start:
                     actions = action_explore
                 else:
                     with torch.no_grad():
-                        m = Q(obs, obs_all, edge_attrs, ridxs)
+                        if args.supervised_signal == 0:
+                            m = Q(obs, obs_all, edge_attrs, ridxs, corr_adj_matrice)
+                        else:
+                            m, _, _ = Q(obs, obs_all, edge_attrs, ridxs, corr_adj_matrice)
                         m[available_actions==0] = -1e9
                         action_exploit = torch.argmax(m, dim=-1).cpu().numpy()
                     actions = np.choose(np.random.uniform(size=len(ac)) < eps, [action_explore, action_exploit])
@@ -1518,7 +1511,7 @@ def main():
                         junction_action_exploit = torch.argmax(p, dim=-1).cpu().numpy()
                     junction_actions = np.choose(np.random.uniform(size=len(junction_available_actions)) < eps, [junction_action_explore, junction_action_exploit])
 
-            new_experiences, next_vehs, success_vehs, infos, next_states, next_all_states, next_edge_attrs, next_ridxs, next_acs, next_junction_states, junction_experiences = env.step(actions, junction_actions)
+            new_experiences, next_vehs, success_vehs, infos, next_states, next_all_states, next_edge_attrs, next_ridxs, next_acs, next_corr_adj_matrice, next_junction_states, junction_experiences = env.step(actions, junction_actions)
             added_experiences += replay.add_tmp(new_experiences)
             j_replay.add_tmp(junction_experiences)
              
@@ -1539,8 +1532,9 @@ def main():
                 batch_size   = int(k * basic_batch_size)
                 update_times = int(k * basic_update_times)
                 overall_loss = 0
+                rl_loss, supervised_loss = 0, 0
                 for _ in range(update_times):
-                    s, a, ac, r, d, sa, ea, ridxs, next_s, next_sa, next_ea = \
+                    s, a, ac, r, d, sa, ea, ridxs, cam, next_s, next_sa, next_ea, next_cam = \
                         replay.sample(batch_size, transpose=False)
                     d = torch.tensor(d, dtype=torch.float32, device=device)
                     loss = 0
@@ -1549,6 +1543,8 @@ def main():
                     r = torch.tensor(r, dtype=torch.float32, device=device)
                     next_s = torch.tensor(np.array(next_s), dtype=torch.float32, device=device)
                     ac = torch.tensor(ac, dtype=torch.float32, device=device)
+                    cam = torch.tensor(np.array(cam), dtype=torch.float32, device=device)
+                    next_cam = torch.tensor(np.array(next_cam), dtype=torch.float32, device=device)
                     if args.agg == 1:
                         sa = torch.tensor(np.array(sa), dtype=torch.float32, device=device)
                         ea = torch.tensor(np.array(ea), dtype=torch.float32, device=device)
@@ -1557,18 +1553,34 @@ def main():
                     ridxs = list(ridxs)
 
                     with torch.no_grad():
-                        m = Q_target(next_s, next_sa, next_ea, ridxs)
+                        if args.supervised_signal == 0:
+                            m = Q_target(next_s, next_sa, next_ea, ridxs, next_cam)
+                        else:
+                            m, _, _ = Q_target(next_s, next_sa, next_ea, ridxs, next_cam)
                         m[ac==0] = -1e9
                         y_target = r+args.gamma*m.max(1).values*(1-d)
-                    y = Q(s, sa, ea, ridxs).gather(-1, a[..., None]).view(-1)
+                    if args.supervised_signal == 0:    
+                        m = Q(s, sa, ea, ridxs, cam)
+                        y = m.gather(-1, a[..., None]).view(-1)
+                    else:
+                        m, obs_predict, obs_true = Q(s, sa, ea, ridxs, cam)
+                        y = Q(s, sa, ea, ridxs, cam)[0].gather(-1, a[..., None]).view(-1)
                     loss = loss+F.mse_loss(y, y_target)
+                    rl_loss += F.mse_loss(y, y_target).item()
+                    if args.supervised_signal == 1:
+                        loss = loss + F.mse_loss(obs_predict, obs_true)
+                        supervised_loss += F.mse_loss(obs_predict, obs_true).item()
                     opt.zero_grad()
                     loss.backward()
                     opt.step()
                     scheduler.step()
                     overall_loss += loss.item()
                 overall_loss /= update_times
+                rl_loss /= update_times
+                supervised_loss /= update_times
                 writer.add_scalar('metric/overall_loss', overall_loss, step)
+                writer.add_scalar('metric/rl_loss', rl_loss, step)
+                writer.add_scalar('metric/supervised_loss', supervised_loss, step)
                 added_experiences = 0
                 training_count += 1
                 if training_count % args.update_threshold == 0:
@@ -1627,6 +1639,7 @@ def main():
             edge_attrs = next_edge_attrs
             ridxs = next_ridxs
             available_actions = next_acs
+            corr_adj_matrice = next_corr_adj_matrice
 
             junction_states = next_junction_states
 
