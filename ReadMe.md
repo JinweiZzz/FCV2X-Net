@@ -1,7 +1,7 @@
 # FCV2X-Net
 
 This repo is the official implementation for FCV2X-Net:
-FCV2X-Net: Foresighted and Coordinated Vehicle-to-Everything Control for Joint Navigation and Signal Optimization
+FCV2X-Net: Foresighted and Coordinated Vehicle-to-Everything Control for Joint Navigation and Signal Optimization.
 
 <!-- ## Overall architecture
 This work aims to construct a prediction framework that predicts high-resolution carbon emissions with open data of satellite images and POI. 
@@ -42,10 +42,10 @@ Configs for performance reproductions on all datasets.
 
 ### Beijing_25
 ```
-python main_FCV2X-Net.py --data data/grid_network_multi_agent_hete --cuda_id 0 --training_start 30000 --experience_threshold 400 --gamma 0.995 --reward emission --step_count 3600 --buffer_size 1000000 --dqn_type dqn --update_threshold 30 --exploration_times 6000000 --agg bgcn --junction_training_start 12000 --junction_experience_threshold 300 --intention 1 --start_lr 0.01 --lr 5e-4 --supervised_signal 1 --mean_field 1
+python main_FCV2X-Net.py --data data/data_25 --cuda_id 0 --training_start 30000 --experience_threshold 400 --gamma 0.995 --reward emission --step_count 3600 --buffer_size 1000000 --dqn_type dqn --update_threshold 30 --exploration_times 6000000 --agg bgcn --junction_training_start 12000 --junction_experience_threshold 300 --intention 1 --start_lr 0.01 --lr 5e-4 --supervised_signal 1 --mean_field 1
 ```
 
 ### Beijing_49
 ```
-python main_FCV2X-Net.py --data data/large_grid_network --cuda_id 1 --training_start 30000 --experience_threshold 800 --gamma 0.995 --reward emission --step_count 3600 --buffer_size 1000000 --dqn_type dqn --update_threshold 30 --exploration_times 6000000 --agg_type bgcn --intention 1 --start_lr 0.01 --lr 5e-4 --supervised_signal 1 --mean_field 1 --batchsize 512 --basic_update_times 3 --balancing_coef 10
+python main_FCV2X-Net.py --data data/data_49 --cuda_id 1 --training_start 30000 --experience_threshold 800 --gamma 0.995 --reward emission --step_count 3600 --buffer_size 1000000 --dqn_type dqn --update_threshold 30 --exploration_times 6000000 --agg_type bgcn --intention 1 --start_lr 0.01 --lr 5e-4 --supervised_signal 1 --mean_field 1 --batchsize 512 --basic_update_times 3 --balancing_coef 10
 ```
