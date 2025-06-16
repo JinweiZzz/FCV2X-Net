@@ -560,20 +560,24 @@ class BGCN_Actor(nn.Module):
 
         self.conv_times = 2
         self.gconv = nn.ModuleList()
-        self.fixed_adj_gconv = nn.ModuleList()
         self.residual = nn.ModuleList()
-        self.fixed_adj_residual = nn.ModuleList()
         for i in range(self.conv_times):
             self.residual.append(nn.Linear(out_dim, out_dim))
             if args.supervised_signal == 0:
                 self.gconv.append(EdgeConvGat(out_dim, edge_dim))
             elif args.supervised_signal == 1:
                 self.gconv.append(EdgeConvGat_supervised(out_dim, edge_dim))
-            self.fixed_adj_residual.append(nn.Linear(out_dim, out_dim))
-            self.fixed_adj_gconv.append(EdgeConvGat(out_dim, edge_dim))
 
-        base_dim = out_dim * max_action * 4
-        self.base = MLPBase(args, base_dim, use_attn_internal=0, use_cat_self=True)
+        if args.agg_type == 'bgcn':
+            base_dim = out_dim * max_action * 2
+            self.gated_layer = nn.Linear(base_dim, out_dim*2)
+        elif args.agg_type == 'none':
+            base_dim = out_dim * max_action
+            self.gated_layer = nn.Linear(base_dim, out_dim*2)
+        else:
+            raise NotImplementedError
+
+        self.base = MLPBase(args, out_dim, use_attn_internal=0, use_cat_self=True)
         self.action_output = nn.Linear(self.base.output_size, max_action)
 
         self.supervised_prediction_layer = nn.Linear(out_dim, out_dim)
@@ -587,7 +591,7 @@ class BGCN_Actor(nn.Module):
             adaptive_adj = adaptive_adj.unsqueeze(0).expand(obs.shape[0], -1, -1)  # (batch_size, num_nodes, num_nodes)
 
         obs = check(obs).to(**self.tpdv)        ### sample_size, obs_dim
-        obs = self.source_obs_map(obs)        ### sample_size, out_dim
+        obs = self.source_obs_map(obs)        ### sample_size, out_dim*max_action
 
         obs_all = check(obs_all).to(**self.tpdv)        ### sample_size, num_roads, obs_dim
         edge_attrs = check(edge_attrs).to(**self.tpdv)        ### sample_size, num_roads, num_roads, 1
@@ -610,22 +614,27 @@ class BGCN_Actor(nn.Module):
                 obs_all_adaptive = F.relu(obs_all_residual + self.gconv[i](obs_all, edge_attrs, corr_adj_matrix))
             else:
                 obs_all_adaptive = None 
-            obs_all_residual_fixed = self.fixed_adj_residual[i](obs_all)
-            obs_all_fixed = F.relu(obs_all_residual_fixed + self.fixed_adj_gconv[i](obs_all, edge_attrs, self.A.unsqueeze(0).expand(obs.shape[0], -1, -1))) 
-
+            
         if self.supervised == 1:
             neighbor_rep = self.supervised_prediction_layer(neighbor_rep)
             neighbor_rep = torch.gather(neighbor_rep, 1, row_indices_expanded)  # (sample_size, max_action, out_dim)
             neighbor_rep[self.road_neighbor_masks[ridxs] == 0] = -1
             neighbor_rep = neighbor_rep.reshape(neighbor_rep.shape[0], -1)  # (sample_size, max_action * out_dim)
-        obs_all_selected = torch.concatenate((torch.gather(obs_all_adaptive, 1, row_indices_expanded), torch.gather(obs_all_fixed, 1, row_indices_expanded)), dim=-1)  # (sample_size, max_action, out_dim * 2)
-        obs_all_selected[self.road_neighbor_masks[ridxs] == 0] = -1
-        obs_all_selected = obs_all_selected.reshape(obs_all_selected.shape[0], -1)  # (sample_size, max_action * out_dim * 2)
+        if self.agg_type != 'none':
+            obs_all_selected = torch.gather(obs_all_adaptive, 1, row_indices_expanded)  # (sample_size, max_action, out_dim)
+            obs_all_selected[self.road_neighbor_masks[ridxs] == 0] = -1
+            obs_all_selected = obs_all_selected.reshape(obs_all_selected.shape[0], -1)  # (sample_size, max_action * out_dim)
         obs_all_origin_selected[self.road_neighbor_masks[ridxs] == 0] = -1
         obs_all_origin_selected = obs_all_origin_selected.reshape(obs_all_origin_selected.shape[0], -1)  # (sample_size, max_action * out_dim)
 
-        obs = torch.concatenate((obs, obs_all_origin_selected, obs_all_selected), dim=-1)  # (batch_size, max_action * out_dim * 4)
-        obs = F.relu(self.base(obs))
+        if self.agg_type != 'none':
+            obs = torch.concatenate((obs, obs_all_selected), dim=-1)  # (batch_size, max_action * out_dim * 2)
+        ### 用gate方式拟合
+        gated_output = self.gated_layer(obs)
+        obs_gated, obs_gate = gated_output.chunk(2, dim=-1)
+        obs_gated = obs_gated * F.sigmoid(obs_gate)
+
+        obs = F.relu(self.base(obs_gated))
         action_policy_values = self.action_output(obs)
         
         if self.supervised == 1:
@@ -633,3 +642,40 @@ class BGCN_Actor(nn.Module):
         else:
             return action_policy_values
                 
+
+        ### 原本的写法
+        # for i in range(self.conv_times):
+        #     obs_all_residual = self.residual[i](obs_all)
+        #     if self.agg_type == 'bgcn':
+        #         if self.supervised == 0:
+        #             aggregated_rep = self.gconv[i](obs_all, edge_attrs, adaptive_adj)
+        #             obs_all_adaptive = F.relu(obs_all_residual + aggregated_rep)
+        #         else:
+        #             aggregated_rep, neighbor_rep = self.gconv[i](obs_all, edge_attrs, adaptive_adj)
+        #             obs_all_adaptive = F.relu(obs_all_residual + aggregated_rep)
+        #     elif self.agg_type == 'corr_agg':
+        #         obs_all_adaptive = F.relu(obs_all_residual + self.gconv[i](obs_all, edge_attrs, corr_adj_matrix))
+        #     else:
+        #         obs_all_adaptive = None 
+        #     obs_all_residual_fixed = self.fixed_adj_residual[i](obs_all)
+        #     obs_all_fixed = F.relu(obs_all_residual_fixed + self.fixed_adj_gconv[i](obs_all, edge_attrs, self.A.unsqueeze(0).expand(obs.shape[0], -1, -1))) 
+
+        # if self.supervised == 1:
+        #     neighbor_rep = self.supervised_prediction_layer(neighbor_rep)
+        #     neighbor_rep = torch.gather(neighbor_rep, 1, row_indices_expanded)  # (sample_size, max_action, out_dim)
+        #     neighbor_rep[self.road_neighbor_masks[ridxs] == 0] = -1
+        #     neighbor_rep = neighbor_rep.reshape(neighbor_rep.shape[0], -1)  # (sample_size, max_action * out_dim)
+        # obs_all_selected = torch.concatenate((torch.gather(obs_all_adaptive, 1, row_indices_expanded), torch.gather(obs_all_fixed, 1, row_indices_expanded)), dim=-1)  # (sample_size, max_action, out_dim * 2)
+        # obs_all_selected[self.road_neighbor_masks[ridxs] == 0] = -1
+        # obs_all_selected = obs_all_selected.reshape(obs_all_selected.shape[0], -1)  # (sample_size, max_action * out_dim * 2)
+        # obs_all_origin_selected[self.road_neighbor_masks[ridxs] == 0] = -1
+        # obs_all_origin_selected = obs_all_origin_selected.reshape(obs_all_origin_selected.shape[0], -1)  # (sample_size, max_action * out_dim)
+
+        # obs = torch.concatenate((obs, obs_all_origin_selected, obs_all_selected), dim=-1)  # (batch_size, max_action * out_dim * 4)
+        # obs = F.relu(self.base(obs))
+        # action_policy_values = self.action_output(obs)
+        
+        # if self.supervised == 1:
+        #     return action_policy_values, neighbor_rep, obs_all_origin_selected
+        # else:
+        #     return action_policy_values
